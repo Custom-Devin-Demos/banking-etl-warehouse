@@ -1,0 +1,9 @@
+# Live mode (lazy-imported; offline mode and the offline tests need only the standard library + pytest)
+snowflake-connector-python>=3.12,<5
+# Tests
+pytest>=8,<10
+# Optional offline extras: SQL<->Python parity on DuckDB, xlsx reader cross-check, lint. Tests skip if absent.
+sqlglot>=26,<31
+duckdb>=1.1,<2
+openpyxl>=3.1,<4
+sqlfluff==3.2.5
