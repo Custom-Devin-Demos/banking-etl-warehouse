@@ -1,0 +1,138 @@
+# Synapse/SQL Server -> Snowflake migration CI (migration/PLAN.md §3, §5 unit 5).
+# Jobs 1-2 run offline and need no credentials. Job 3 runs the validation harness against a live
+# Snowflake account only when the SNOWFLAKE_ACCOUNT repository secret is configured; otherwise it is skipped.
+name: snowflake-migration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snowflake-migration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.10"
+  SQLFLUFF_VERSION: "3.2.5"
+
+jobs:
+  sqlfluff-lint:
+    name: Lint Snowflake SQL (sqlfluff)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install sqlfluff
+        run: python -m pip install "sqlfluff==${SQLFLUFF_VERSION}"
+      - name: sqlfluff lint migration/
+        # Uses the repo-root .sqlfluff (snowflake dialect) and .sqlfluffignore (legacy T-SQL excluded).
+        run: sqlfluff lint migration/
+
+  offline-tests:
+    name: Offline unit tests (pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install migration requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pytest>=7,<9"
+          # Each unit may ship its own requirements*.txt; install whichever exist (none is fine).
+          find migration -name 'requirements*.txt' -type f | sort | while read -r req; do
+            echo "::group::pip install -r ${req}"
+            python -m pip install -r "${req}"
+            echo "::endgroup::"
+          done
+      - name: pytest migration
+        env:
+          # Offline job: make sure no live check can run even if a runner leaks env.
+          SNOWFLAKE_ACCOUNT: ""
+        run: |
+          set +e
+          python -m pytest migration -ra
+          rc=$?
+          set -e
+          # Exit code 5 = no tests collected (other units' test directories may not exist yet).
+          if [ "${rc}" -eq 5 ]; then
+            echo "::notice::pytest collected no tests under migration/; treating as success."
+            exit 0
+          fi
+          exit "${rc}"
+
+  live-check-gate:
+    name: Detect Snowflake credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - id: gate
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+        run: |
+          if [ -n "${SNOWFLAKE_ACCOUNT}" ]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::SNOWFLAKE_ACCOUNT secret not configured; live validation will be skipped."
+          fi
+
+  live-validation:
+    name: Live validation against Snowflake
+    needs: [live-check-gate, sqlfluff-lint, offline-tests]
+    if: needs.live-check-gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE || 'BANKING_DWH' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Write key-pair private key (optional)
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          if [ -n "${SNOWFLAKE_PRIVATE_KEY}" ]; then
+            key_path="${RUNNER_TEMP}/snowflake_rsa_key.p8"
+            umask 077
+            printf '%s\n' "${SNOWFLAKE_PRIVATE_KEY}" > "${key_path}"
+            echo "SNOWFLAKE_PRIVATE_KEY_PATH=${key_path}" >> "${GITHUB_ENV}"
+          fi
+      - name: Install validation requirements
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f migration/validation/requirements.txt ]; then
+            python -m pip install -r migration/validation/requirements.txt
+          else
+            python -m pip install snowflake-connector-python
+          fi
+      - name: Run validation harness
+        run: |
+          if [ ! -f migration/validation/validate.py ]; then
+            echo "::error::SNOWFLAKE_ACCOUNT is configured but migration/validation/validate.py does not exist."
+            exit 1
+          fi
+          python migration/validation/validate.py
+      - name: Remove private key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/snowflake_rsa_key.p8"

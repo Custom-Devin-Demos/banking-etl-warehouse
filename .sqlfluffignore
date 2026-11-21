@@ -1,0 +1,3 @@
+sql_scripts/
+# T-SQL used to produce the SQL Server baseline, not Snowflake SQL.
+migration/baseline/
