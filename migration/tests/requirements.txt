@@ -1,0 +1,3 @@
+# Unit 5 repo-level contract checks (migration/tests). Ranges, not pins, so they co-install with other units.
+pytest>=7,<9
+PyYAML>=6,<7
