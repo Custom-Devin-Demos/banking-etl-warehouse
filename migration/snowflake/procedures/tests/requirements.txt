@@ -1,0 +1,5 @@
+# Offline tests for migration/snowflake/procedures (no Snowflake account needed).
+pytest>=7
+duckdb>=1.1
+sqlglot>=25
+sqlfluff==3.2.5
